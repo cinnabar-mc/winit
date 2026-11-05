@@ -624,6 +624,10 @@ impl Inner {
         self.view_controller.set_prefers_status_bar_hidden(hidden);
     }
 
+    pub fn set_prefers_pointer_locked(&self, locked: bool) {
+        self.view_controller.set_prefers_pointer_locked(locked);
+    }
+
     pub fn set_preferred_status_bar_style(&self, status_bar_style: StatusBarStyle) {
         self.view_controller.set_preferred_status_bar_style(status_bar_style);
     }

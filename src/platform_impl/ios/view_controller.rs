@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use objc2::rc::Retained;
 use objc2::{declare_class, msg_send_id, mutability, ClassType, DeclaredClass};
-use objc2_foundation::{MainThreadMarker, NSObject};
+use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol};
 use objc2_ui_kit::{
     UIDevice, UIInterfaceOrientationMask, UIRectEdge, UIResponder, UIStatusBarStyle,
     UIUserInterfaceIdiom, UIView, UIViewController,
@@ -18,6 +18,7 @@ pub struct ViewControllerState {
     prefers_home_indicator_auto_hidden: Cell<bool>,
     supported_orientations: Cell<UIInterfaceOrientationMask>,
     preferred_screen_edges_deferring_system_gestures: Cell<UIRectEdge>,
+    prefers_pointer_locked: Cell<bool>,
 }
 
 declare_class!(
@@ -60,6 +61,11 @@ declare_class!(
             self.ivars().supported_orientations.get()
         }
 
+        #[method(prefersPointerLocked)]
+        fn prefers_pointer_locked(&self) -> bool {
+            self.ivars().prefers_pointer_locked.get()
+        }
+
         #[method(preferredScreenEdgesDeferringSystemGestures)]
         fn preferred_screen_edges_deferring_system_gestures(&self) -> UIRectEdge {
             self.ivars()
@@ -92,6 +98,14 @@ impl WinitViewController {
             self.setNeedsUpdateOfHomeIndicatorAutoHidden();
         } else {
             os_capabilities.home_indicator_hidden_err_msg("ignoring")
+        }
+    }
+
+    pub(crate) fn set_prefers_pointer_locked(&self, val: bool) {
+        self.ivars().prefers_pointer_locked.set(val);
+        // Pointer locking exists from iOS 14; earlier systems never ask for the preference.
+        if self.respondsToSelector(objc2::sel!(setNeedsUpdateOfPrefersPointerLocked)) {
+            unsafe { self.setNeedsUpdateOfPrefersPointerLocked() };
         }
     }
 
@@ -145,6 +159,7 @@ impl WinitViewController {
             prefers_home_indicator_auto_hidden: Cell::new(false),
             supported_orientations: Cell::new(UIInterfaceOrientationMask::All),
             preferred_screen_edges_deferring_system_gestures: Cell::new(UIRectEdge::empty()),
+            prefers_pointer_locked: Cell::new(false),
         });
         let this: Retained<Self> = unsafe { msg_send_id![super(this), init] };
 

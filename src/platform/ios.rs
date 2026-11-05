@@ -151,6 +151,17 @@ pub trait WindowExtIOS {
     /// is also called for you.
     fn set_prefers_status_bar_hidden(&self, hidden: bool);
 
+    /// Sets whether the [`Window`] prefers the pointer locked, hiding it and keeping it in
+    /// place so mice report motion only through the Game Controller framework's `GCMouse`.
+    ///
+    /// The default is `false`. iPadOS honors the preference only for full-screen apps on
+    /// iOS 14 and later.
+    ///
+    /// This sets the value of the
+    /// [`prefersPointerLocked`](https://developer.apple.com/documentation/uikit/uiviewcontroller/3601235-preferspointerlocked?language=objc)
+    /// property, and calls `setNeedsUpdateOfPrefersPointerLocked()` for you.
+    fn set_prefers_pointer_locked(&self, locked: bool);
+
     /// Sets the preferred status bar style for the [`Window`].
     ///
     /// The default is system-defined.
@@ -223,6 +234,10 @@ impl WindowExtIOS for Window {
     }
 
     #[inline]
+    fn set_prefers_pointer_locked(&self, locked: bool) {
+        self.window.maybe_queue_on_main(move |w| w.set_prefers_pointer_locked(locked))
+    }
+
     fn set_preferred_status_bar_style(&self, status_bar_style: StatusBarStyle) {
         self.window.maybe_queue_on_main(move |w| w.set_preferred_status_bar_style(status_bar_style))
     }
