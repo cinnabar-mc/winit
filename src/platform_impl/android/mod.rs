@@ -3,10 +3,10 @@ use std::collections::VecDeque;
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{Axis, InputEvent, KeyAction, Keycode, MotionAction, MotionEvent};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -33,6 +33,39 @@ pub(crate) use crate::cursor::{
 pub(crate) use crate::icon::NoIcon as PlatformIcon;
 
 static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
+
+/// Application hook consulted before winit translates an input event; `true` consumes it.
+static INPUT_EVENT_FILTER: OnceLock<fn(&InputEvent<'_>) -> bool> = OnceLock::new();
+
+/// Installs the process-wide input filter. Returns `false` when one was already installed.
+pub(crate) fn set_input_event_filter(filter: fn(&InputEvent<'_>) -> bool) -> bool {
+    INPUT_EVENT_FILTER.set(filter).is_ok()
+}
+
+/// `AINPUT_SOURCE_MOUSE`: an absolute pointer such as a mouse or a trackpad in mouse mode.
+const SOURCE_MOUSE: u32 = 0x0000_2002;
+/// `AINPUT_SOURCE_MOUSE_RELATIVE`: a mouse under pointer capture, reporting motion deltas.
+const SOURCE_MOUSE_RELATIVE: u32 = 0x0002_0004;
+/// `AINPUT_SOURCE_CLASS_JOYSTICK`: gamepad sticks, triggers and hats.
+const SOURCE_CLASS_JOYSTICK: u32 = 0x0000_0010;
+/// Primary, secondary, tertiary, back and forward `AMOTION_EVENT_BUTTON_*` bits.
+const MOUSE_BUTTONS: [(u32, event::MouseButton); 5] = [
+    (0x01, event::MouseButton::Left),
+    (0x02, event::MouseButton::Right),
+    (0x04, event::MouseButton::Middle),
+    (0x08, event::MouseButton::Back),
+    (0x10, event::MouseButton::Forward),
+];
+
+fn has_source(source: u32, wanted: u32) -> bool {
+    source & wanted == wanted
+}
+
+/// Sums an axis over the event's batched history and its current sample.
+fn summed_axis(motion_event: &MotionEvent<'_>, axis: Axis) -> f32 {
+    let pointer = motion_event.pointer_at_index(0);
+    pointer.history().map(|sample| sample.axis_value(axis)).sum::<f32>() + pointer.axis_value(axis)
+}
 
 /// Returns the minimum `Option<Duration>`, taking into account that `None`
 /// equates to an infinite timeout, not a zero timeout (so can't just use
@@ -143,6 +176,8 @@ pub struct EventLoop<T: 'static> {
     cause: StartCause,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
+    /// Mouse buttons reported down by the last mouse event, as `AMOTION_EVENT_BUTTON_*` bits.
+    mouse_buttons: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,6 +227,7 @@ impl<T: 'static> EventLoop<T> {
             cause: StartCause::Init,
             ignore_volume_keys: attributes.ignore_volume_keys,
             combining_accent: None,
+            mouse_buttons: 0,
         })
     }
 
@@ -372,8 +408,24 @@ impl<T: 'static> EventLoop<T> {
         F: FnMut(event::Event<T>, &RootAEL),
     {
         let mut input_status = InputStatus::Handled;
+        if INPUT_EVENT_FILTER.get().is_some_and(|filter| filter(event)) {
+            return input_status;
+        }
         match event {
             InputEvent::MotionEvent(motion_event) => {
+                let source = u32::from(motion_event.source());
+                if source & SOURCE_CLASS_JOYSTICK != 0 {
+                    // Stick and trigger motion is not touch input; leave it to the system.
+                    return InputStatus::Unhandled;
+                }
+                if has_source(source, SOURCE_MOUSE_RELATIVE) {
+                    self.handle_mouse_event(motion_event, true, callback);
+                    return input_status;
+                }
+                if has_source(source, SOURCE_MOUSE) {
+                    self.handle_mouse_event(motion_event, false, callback);
+                    return input_status;
+                }
                 let window_id = window::WindowId(WindowId);
                 let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
 
@@ -433,6 +485,10 @@ impl<T: 'static> EventLoop<T> {
                     {
                         input_status = InputStatus::Unhandled
                     },
+                    // Mouse back and forward buttons also synthesize these keys; the mouse
+                    // events already report those buttons.
+                    Keycode::Back | Keycode::Forward
+                        if has_source(u32::from(key.source()), SOURCE_MOUSE) => {},
                     keycode => {
                         let state = match key.action() {
                             KeyAction::Down => event::ElementState::Pressed,
@@ -479,6 +535,97 @@ impl<T: 'static> EventLoop<T> {
         }
 
         input_status
+    }
+
+    /// Translates mouse motion events. `relative` events come from a captured pointer and
+    /// carry motion deltas instead of a cursor position.
+    fn handle_mouse_event<F>(
+        &mut self,
+        motion_event: &MotionEvent<'_>,
+        relative: bool,
+        callback: &mut F,
+    ) where
+        F: FnMut(event::Event<T>, &RootAEL),
+    {
+        let window_id = window::WindowId(WindowId);
+        let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
+        let action = motion_event.action();
+        let pointer = motion_event.pointer_at_index(0);
+        let position = PhysicalPosition { x: pointer.x() as f64, y: pointer.y() as f64 };
+        let window_event = |event| event::Event::WindowEvent { window_id, event };
+
+        if matches!(action, MotionAction::Move | MotionAction::HoverMove) {
+            let (x, y) =
+                if relative { (Axis::X, Axis::Y) } else { (Axis::RelativeX, Axis::RelativeY) };
+            let delta = (summed_axis(motion_event, x), summed_axis(motion_event, y));
+            if delta != (0.0, 0.0) {
+                callback(
+                    event::Event::DeviceEvent {
+                        device_id,
+                        event: event::DeviceEvent::MouseMotion {
+                            delta: (delta.0 as f64, delta.1 as f64),
+                        },
+                    },
+                    self.window_target(),
+                );
+            }
+        }
+
+        match action {
+            MotionAction::HoverEnter if !relative => {
+                callback(
+                    window_event(event::WindowEvent::CursorEntered { device_id }),
+                    self.window_target(),
+                );
+            },
+            MotionAction::HoverExit if !relative && self.mouse_buttons == 0 => {
+                callback(
+                    window_event(event::WindowEvent::CursorLeft { device_id }),
+                    self.window_target(),
+                );
+            },
+            MotionAction::Scroll => {
+                let delta = event::MouseScrollDelta::LineDelta(
+                    -pointer.axis_value(Axis::Hscroll),
+                    pointer.axis_value(Axis::Vscroll),
+                );
+                callback(
+                    window_event(event::WindowEvent::MouseWheel {
+                        device_id,
+                        delta,
+                        phase: event::TouchPhase::Moved,
+                    }),
+                    self.window_target(),
+                );
+            },
+            MotionAction::HoverExit | MotionAction::HoverEnter | MotionAction::Outside => {},
+            _ if !relative => {
+                callback(
+                    window_event(event::WindowEvent::CursorMoved { device_id, position }),
+                    self.window_target(),
+                );
+            },
+            _ => {},
+        }
+
+        let buttons =
+            if matches!(action, MotionAction::Cancel) { 0 } else { motion_event.button_state().0 };
+        let changed = buttons ^ self.mouse_buttons;
+        self.mouse_buttons = buttons;
+        for (bit, button) in MOUSE_BUTTONS {
+            if changed & bit == 0 {
+                continue;
+            }
+            let state = if buttons & bit != 0 {
+                event::ElementState::Pressed
+            } else {
+                event::ElementState::Released
+            };
+            callback(
+                window_event(event::WindowEvent::MouseInput { device_id, state, button }),
+                self.window_target(),
+            );
+        }
     }
 
     pub fn run<F>(mut self, event_handler: F) -> Result<(), EventLoopError>

@@ -145,6 +145,17 @@ impl<T> EventLoopBuilderExtAndroid for EventLoopBuilder<T> {
     }
 }
 
+/// Installs a process-wide filter that sees every Android input event before winit translates
+/// it. Returning `true` consumes the event: winit reports it handled and emits nothing for it.
+///
+/// Winit has no gamepad events, so applications use this to read controller keys and joystick
+/// motion. Joystick motion the filter leaves is reported unhandled rather than as touches.
+/// Returns `false` without replacing the filter when one was already installed.
+#[cfg(android_platform)]
+pub fn set_input_event_filter(filter: fn(&activity::input::InputEvent<'_>) -> bool) -> bool {
+    crate::platform_impl::set_input_event_filter(filter)
+}
+
 /// Re-export of the `android_activity` API
 ///
 /// Winit re-exports the `android_activity` API for convenience so that most
