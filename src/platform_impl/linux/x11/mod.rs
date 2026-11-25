@@ -71,18 +71,26 @@ type X11Source = Generic<BorrowedFd<'static>>;
 struct WakeSender<T> {
     sender: Sender<T>,
     waker: Ping,
+    /// The event loop's thread, for a channel that the loop checks for pending messages before it
+    /// can block. A message sent on that thread needs no wake-up: the loop is running a callback,
+    /// not waiting, and sees the message at that check.
+    loop_thread: Option<std::thread::ThreadId>,
 }
 
 impl<T> Clone for WakeSender<T> {
     fn clone(&self) -> Self {
-        Self { sender: self.sender.clone(), waker: self.waker.clone() }
+        Self {
+            sender: self.sender.clone(),
+            waker: self.waker.clone(),
+            loop_thread: self.loop_thread,
+        }
     }
 }
 
 impl<T> WakeSender<T> {
     pub fn send(&self, t: T) -> Result<(), EventLoopClosed<T>> {
         let res = self.sender.send(t).map_err(|e| EventLoopClosed(e.0));
-        if res.is_ok() {
+        if res.is_ok() && self.loop_thread != Some(std::thread::current().id()) {
             self.waker.ping();
         }
         res
@@ -297,10 +305,14 @@ impl<T: 'static> EventLoop<T> {
             redraw_sender: WakeSender {
                 sender: redraw_sender, // not used again so no clone
                 waker: waker.clone(),
+                // `has_pending` checks redraw requests before every wait, so the redraw
+                // `about_to_wait` requests each frame does not have to wake the loop.
+                loop_thread: Some(std::thread::current().id()),
             },
             activation_sender: WakeSender {
                 sender: activation_token_sender, // not used again so no clone
                 waker: waker.clone(),
+                loop_thread: None,
             },
             device_events: Default::default(),
         };
@@ -369,7 +381,11 @@ impl<T: 'static> EventLoop<T> {
 
     pub fn create_proxy(&self) -> EventLoopProxy<T> {
         EventLoopProxy {
-            user_sender: WakeSender { sender: self.user_sender.clone(), waker: self.waker.clone() },
+            user_sender: WakeSender {
+                sender: self.user_sender.clone(),
+                waker: self.waker.clone(),
+                loop_thread: None,
+            },
         }
     }
 
@@ -1061,4 +1077,38 @@ impl Device {
 #[inline]
 fn xinput_fp1616_to_float(fp: xinput::Fp1616) -> f64 {
     (fp as f64) / ((1 << 16) as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sends one message through a `WakeSender` bound to `loop_thread`, on this thread or another,
+    /// and returns whether an event loop waiting on its ping woke and whether the message arrived.
+    fn send_once(
+        loop_thread: Option<std::thread::ThreadId>,
+        from_another_thread: bool,
+    ) -> (bool, bool) {
+        let (waker, source) = calloop::ping::make_ping().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let sender = WakeSender { sender, waker, loop_thread };
+        let mut event_loop = calloop::EventLoop::<bool>::try_new().unwrap();
+        event_loop.handle().insert_source(source, |_, _, woke| *woke = true).unwrap();
+        if from_another_thread {
+            std::thread::spawn(move || sender.send(1).unwrap()).join().unwrap();
+        } else {
+            sender.send(1).unwrap();
+        }
+        let mut woke = false;
+        event_loop.dispatch(Some(Duration::ZERO), &mut woke).unwrap();
+        (woke, receiver.try_recv().is_ok())
+    }
+
+    #[test]
+    fn a_message_sent_on_the_loop_thread_does_not_wake_the_loop() {
+        let here = Some(std::thread::current().id());
+        assert_eq!(send_once(here, false), (false, true));
+        assert_eq!(send_once(here, true), (true, true), "another thread still wakes the loop");
+        assert_eq!(send_once(None, false), (true, true), "unbound senders always wake it");
+    }
 }
