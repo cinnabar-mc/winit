@@ -495,9 +495,13 @@ impl<T: 'static> EventLoop<T> {
         // have any pending `_receiver` events and if not we return without
         // running a loop iteration.
         // If we don't have any pending `_receiver`
-        if !self.has_pending()
+        //
+        // Only a wait without a timeout can end in such a wake-up, so check that first: with a
+        // timeout the iteration runs anyway, and `has_pending` would only cost an `XPending`
+        // (an output flush and a socket read) whose answer is not used.
+        if timeout.is_none()
             && !matches!(&cause, StartCause::ResumeTimeReached { .. } | StartCause::Poll)
-            && timeout.is_none()
+            && !self.has_pending()
         {
             return;
         }
